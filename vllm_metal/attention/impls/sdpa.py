@@ -1194,7 +1194,7 @@ def sdpa_forward(
                 end = min(start + _LAB_PREFILL_KEY_RANGE, length)
                 state = ops._tiled_key_range_for_lab(
                     q_3d, kernel_k_cache, kernel_v_cache, block_tables, seq_lens,
-                    cu_seqlens_q, attn_scale, start, (end + 15) // 16 * 16,
+                    cu_seqlens_q, attn_scale, kernel_block_size, start, (end + 15) // 16 * 16,
                     end == length, state,
                 )
                 mx.eval(state)

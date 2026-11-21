@@ -578,16 +578,18 @@ class TiledKeyRangePrimitive : public UnaryPrimitive {
 array tiled_key_range_for_lab(
     const array& q, const array& k, const array& v, const array& table,
     const array& seq_lens, const array& cu_seqlens_q, float scale,
-    int key_begin, int key_end, bool final_range, const array* previous_state) {
+    int block_size, int key_begin, int key_end, bool final_range,
+    const array* previous_state) {
   const auto cfg = kernels::select_tile_config(q.shape(2));
-  if (!cfg || key_begin < 0 || key_begin >= key_end ||
+  if (!cfg || (block_size != 8 && block_size != 16 && block_size != 32) ||
+      k.shape(1) % block_size || key_begin < 0 || key_begin >= key_end ||
       key_begin % cfg->TILE_KV || key_end % cfg->TILE_KV ||
       (previous_state == nullptr) != (key_begin == 0) ||
       (final_range && key_begin == 0)) {
     throw std::invalid_argument("invalid tiled-attention key range");
   }
   auto prim = std::make_shared<TiledKeyRangePrimitive>(
-      default_stream(Device::gpu), k.shape(2), scale, k.shape(1),
+      default_stream(Device::gpu), k.shape(2), scale, block_size,
       key_begin, key_end, final_range);
   std::vector<array> inputs{q, k, v, table, seq_lens, cu_seqlens_q};
   if (previous_state != nullptr) inputs.push_back(*previous_state);
