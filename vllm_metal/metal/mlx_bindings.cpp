@@ -15,6 +15,9 @@
 
 namespace nb = nanobind;
 void register_mlx_patch(nb::module_& m);
+array tiled_key_range_for_lab(
+    const array&, const array&, const array&, const array&, const array&,
+    const array&, float, int, int, bool, const array*);
 using hardware::override_detected_gpu_core_count_for_test;
 
 static bool set_paged_dispatch_diagnostics(bool enabled) {
@@ -435,6 +438,11 @@ NB_MODULE(_paged_ops, m) {
 
   // Paged attention primitive (read-only): dispatches paged_attention_v2_online.
   // Cache writes are handled by MLX-native scatter upstream.
+  m.def("_tiled_key_range_for_lab", &tiled_key_range_for_lab,
+        nb::arg("query"), nb::arg("key"), nb::arg("value"), nb::arg("table"),
+        nb::arg("seq_lens"), nb::arg("cu_seqlens_q"), nb::arg("scale"),
+        nb::arg("key_begin"), nb::arg("key_end"), nb::arg("final_range"),
+        nb::arg("previous_state").none() = nb::none());
   m.def("paged_attention_primitive",
         [](const array& query,
            const array& key_cache, const array& value_cache,

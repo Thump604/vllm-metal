@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -74,6 +75,7 @@ logger = init_logger(__name__)
 # both query rows and visible keys so short suffixes and wide scheduler
 # chunks can hit the same guard at different context lengths.
 _PREFILL_WAIT_QK_PAIRS = 32 * 1024 * 1024
+_LAB_PREFILL_KEY_RANGE = int(os.environ.get("AI_OPS_TILED_KEY_RANGE", "0"))
 
 
 def _has_packed_qkv_sdpa_contract(module: nn.Module) -> bool:
@@ -1153,24 +1155,7 @@ def sdpa_forward(
                     capabilities, work, q_3d.shape[2], prefill_work=prefill_work
                 )
             )
-        out = ops.paged_attention_primitive(
-            q_3d,
-            kernel_k_cache,
-            kernel_v_cache,
-            cache_kv_heads,
-            attn_scale,
-            attn_softcap,
-            block_tables,
-            seq_lens,
-            cu_seqlens_q,
-            kernel_block_size,
-            max_seq_len,
-            layer_sliding_window,
-            window_seqlen_q=ctx.verify_window_q,
-            sinks=sinks,
-            **paged_kwargs,
-        )
-        if (
+        heavy_hybrid_prefill = (
             ctx.state_group_slot_mappings is not None
             and num_decode < len(ctx.context_lens)
             and num_decode == ctx.num_decode_tokens
@@ -1187,14 +1172,60 @@ def sdpa_forward(
                 )
             )
             >= _PREFILL_WAIT_QK_PAIRS
+        )
+        if (
+            _LAB_PREFILL_KEY_RANGE > 0
+            and heavy_hybrid_prefill
+            and len(ctx.context_lens) == 1
+            and num_decode == 0
+            and ctx.verify_window_q == 1
+            and q_3d.shape[2] == 256
+            and ctx.context_lens[0] > _LAB_PREFILL_KEY_RANGE
+            and not attn_softcap
+            and sinks is None
         ):
-            # Finish a heavy layer before encoding more work on this stream.
-            # Submitting it asynchronously alone can leave several layers queued.
+            length = ctx.context_lens[0]
             logger.info_once(
-                "Metal: completing heavy aligned hybrid prefill attention per layer."
+                "Metal lab: continuing FP32 prefill attention across %d-key ranges.",
+                _LAB_PREFILL_KEY_RANGE,
             )
-            mx.eval(out)
-            mx.synchronize()
+            state = None
+            for start in range(0, length, _LAB_PREFILL_KEY_RANGE):
+                end = min(start + _LAB_PREFILL_KEY_RANGE, length)
+                state = ops._tiled_key_range_for_lab(
+                    q_3d, kernel_k_cache, kernel_v_cache, block_tables, seq_lens,
+                    cu_seqlens_q, attn_scale, start, (end + 15) // 16 * 16,
+                    end == length, state,
+                )
+                mx.eval(state)
+                mx.synchronize()
+            out = state
+        else:
+            out = ops.paged_attention_primitive(
+                q_3d,
+                kernel_k_cache,
+                kernel_v_cache,
+                cache_kv_heads,
+                attn_scale,
+                attn_softcap,
+                block_tables,
+                seq_lens,
+                cu_seqlens_q,
+                kernel_block_size,
+                max_seq_len,
+                layer_sliding_window,
+                window_seqlen_q=ctx.verify_window_q,
+                sinks=sinks,
+                **paged_kwargs,
+            )
+            if heavy_hybrid_prefill:
+                # Finish a heavy layer before encoding more work on this stream.
+                # Submitting it asynchronously alone can leave several layers queued.
+                logger.info_once(
+                    "Metal: completing heavy aligned hybrid prefill attention per layer."
+                )
+                mx.eval(out)
+                mx.synchronize()
 
     if recompute_after_kernel:
         assert ctx.cu_seqlens is not None

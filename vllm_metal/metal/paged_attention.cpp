@@ -487,7 +487,9 @@ static void dispatch_paged_attention_tiled(
     const array& cu_seqlens_q,
     int block_size, int max_seq_len, int sliding_window, int q_block_offset,
     kernels::TileConfig cfg, Stream s, const array* sinks,
-    const array* mm_prefix_ranges) {
+    const array* mm_prefix_ranges,
+    const array* previous_state = nullptr, bool save_state = false,
+    std::array<int, 2> key_tiles = {}) {
   auto& d = metal::device(s.device);
 
   int total_q_tokens = static_cast<int>(query.shape(0));
@@ -502,10 +504,14 @@ static void dispatch_paged_attention_tiled(
   // Both constants are set on every dispatch: a function that references an
   // unset function constant fails pipeline creation.  MLX caches pipelines
   // by hash_name, so each constant combination needs its own suffix.
+  const bool restore_state = previous_state != nullptr;
   auto* kernel = d.get_kernel(
-      plan.base_kname, lib, plan.hash_name,
+      plan.base_kname, lib, plan.hash_name + (restore_state ? "_r1" : "_r0")
+          + (save_state ? "_s1" : "_s0"),
       {{&plan.use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
-       {&plan.use_mm_prefix, MTL::DataType::DataTypeBool, NS::UInteger(120)}});
+       {&plan.use_mm_prefix, MTL::DataType::DataTypeBool, NS::UInteger(120)},
+       {&restore_state, MTL::DataType::DataTypeBool, NS::UInteger(121)},
+       {&save_state, MTL::DataType::DataTypeBool, NS::UInteger(122)}});
 
   int num_heads = static_cast<int>(query.shape(1));
   auto& enc = metal::get_command_encoder(s);
@@ -525,10 +531,70 @@ static void dispatch_paged_attention_tiled(
   if (plan.use_mm_prefix) {
     enc.set_input_array(*mm_prefix_ranges, 22);
   }
+  if (restore_state) enc.set_input_array(*previous_state, 23);
+  if (save_state) enc.set_output_array(out, 24);
+  if (restore_state || save_state) enc.set_bytes(key_tiles, 25);
 
   enc.dispatch_threadgroups(
       MTL::Size::Make(num_heads, plan.q_blocks, 1),
       MTL::Size::Make(plan.num_threads, 1, 1));
+}
+
+// Lab binding for measuring explicit submission boundaries with identical
+// ordered, FP32 online-softmax state. The production dispatch never uses it.
+class TiledKeyRangePrimitive : public UnaryPrimitive {
+ public:
+  TiledKeyRangePrimitive(Stream stream, int kv_heads, float scale, int block_size,
+                        int key_begin, int key_end, bool final_range)
+      : UnaryPrimitive(stream), kv_heads_(kv_heads), scale_(scale),
+        block_size_(block_size), key_begin_(key_begin), key_end_(key_end),
+        final_range_(final_range) {}
+
+  void eval_cpu(const std::vector<array>&, array&) override {
+    throw std::runtime_error("TiledKeyRangePrimitive only supports GPU");
+  }
+
+  void eval_gpu(const std::vector<array>& in, array& out) override {
+    const auto cfg = *kernels::select_tile_config(in[0].shape(2));
+    out.set_data(allocator::malloc(out.nbytes()));
+    dispatch_paged_attention_tiled(
+        out, in[0], in[1], in[2], kv_heads_, scale_, 0.0f, in[3], in[4],
+        in[5], block_size_, key_end_, -1, 0, cfg, stream(), nullptr, nullptr,
+        in.size() == 7 ? &in[6] : nullptr, !final_range_,
+        {key_begin_ / cfg.TILE_KV, key_end_ / cfg.TILE_KV});
+  }
+
+  const char* name() const override { return "TiledKeyRange"; }
+
+ private:
+  int kv_heads_;
+  float scale_;
+  int block_size_;
+  int key_begin_;
+  int key_end_;
+  bool final_range_;
+};
+
+array tiled_key_range_for_lab(
+    const array& q, const array& k, const array& v, const array& table,
+    const array& seq_lens, const array& cu_seqlens_q, float scale,
+    int key_begin, int key_end, bool final_range, const array* previous_state) {
+  const auto cfg = kernels::select_tile_config(q.shape(2));
+  if (!cfg || key_begin < 0 || key_begin >= key_end ||
+      key_begin % cfg->TILE_KV || key_end % cfg->TILE_KV ||
+      (previous_state == nullptr) != (key_begin == 0) ||
+      (final_range && key_begin == 0)) {
+    throw std::invalid_argument("invalid tiled-attention key range");
+  }
+  auto prim = std::make_shared<TiledKeyRangePrimitive>(
+      default_stream(Device::gpu), k.shape(2), scale, k.shape(1),
+      key_begin, key_end, final_range);
+  std::vector<array> inputs{q, k, v, table, seq_lens, cu_seqlens_q};
+  if (previous_state != nullptr) inputs.push_back(*previous_state);
+  Shape shape = q.shape();
+  if (!final_range) shape[2] += 2;
+  return array(std::move(shape), final_range ? q.dtype() : float32,
+               std::move(prim), std::move(inputs));
 }
 
 // ---------------------------------------------------------------------------
