@@ -1176,26 +1176,34 @@ def sdpa_forward(
         if (
             _LAB_PREFILL_KEY_RANGE > 0
             and heavy_hybrid_prefill
-            and len(ctx.context_lens) == 1
-            and num_decode == 0
+            and len(ctx.context_lens) - num_decode == 1
             and ctx.verify_window_q == 1
             and q_3d.shape[2] == 256
-            and ctx.context_lens[0] > _LAB_PREFILL_KEY_RANGE
+            and max_seq_len > _LAB_PREFILL_KEY_RANGE
             and not attn_softcap
             and sinks is None
         ):
-            length = ctx.context_lens[0]
             logger.info_once(
-                "Metal lab: continuing FP32 prefill attention across %d-key ranges.",
+                "Metal lab: continuing FP32 prefill across %d-key ranges with %d active decode rows.",
                 _LAB_PREFILL_KEY_RANGE,
+                num_decode,
             )
             state = None
-            for start in range(0, length, _LAB_PREFILL_KEY_RANGE):
-                end = min(start + _LAB_PREFILL_KEY_RANGE, length)
+            for start in range(0, max_seq_len, _LAB_PREFILL_KEY_RANGE):
+                end = min(start + _LAB_PREFILL_KEY_RANGE, max_seq_len)
                 state = ops._tiled_key_range_for_lab(
-                    q_3d, kernel_k_cache, kernel_v_cache, block_tables, seq_lens,
-                    cu_seqlens_q, attn_scale, kernel_block_size, start, (end + 15) // 16 * 16,
-                    end == length, state,
+                    q_3d,
+                    kernel_k_cache,
+                    kernel_v_cache,
+                    block_tables,
+                    seq_lens,
+                    cu_seqlens_q,
+                    attn_scale,
+                    kernel_block_size,
+                    start,
+                    (end + 15) // 16 * 16,
+                    end == max_seq_len,
+                    state,
                 )
                 mx.eval(state)
                 mx.synchronize()
