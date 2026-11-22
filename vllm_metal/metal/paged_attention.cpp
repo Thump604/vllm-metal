@@ -581,6 +581,13 @@ array tiled_key_range_for_lab(
     int block_size, int key_begin, int key_end, bool final_range,
     const array* previous_state) {
   const auto cfg = kernels::select_tile_config(q.shape(2));
+  if (previous_state != nullptr &&
+      (previous_state->dtype() != float32 || previous_state->ndim() != 3 ||
+       previous_state->shape(0) != q.shape(0) ||
+       previous_state->shape(1) != q.shape(1) ||
+       previous_state->shape(2) != q.shape(2) + 2)) {
+    throw std::invalid_argument("invalid tiled-attention FP32 state shape");
+  }
   if (!cfg || (block_size != 8 && block_size != 16 && block_size != 32) ||
       k.shape(1) % block_size || key_begin < 0 || key_begin >= key_end ||
       key_begin % cfg->TILE_KV || key_end % cfg->TILE_KV ||
@@ -935,6 +942,45 @@ static PagedAttentionPlan select_paged_attention_route(
       : (partition ? PagedAttentionRoute::SplitKv : PagedAttentionRoute::PerToken);
   plan.route = scratch_fits ? PagedAttentionRoute::GqaDecode : plan.fallback;
   return plan;
+}
+
+std::optional<int> ordinary_tiled_key_alignment(
+    const array& query, const array& key, const array& value,
+    int num_seqs, int block_size, int max_seq_len, int num_decode_requests,
+    int num_decode_tokens, int max_decode_context_len,
+    const std::optional<GqaDecodeLengthPlan>& gqa_length_plan) {
+  if (query.ndim() != 3 || key.ndim() != 4 || value.ndim() != 4 ||
+      query.shape(0) <= num_seqs || query.dtype() != key.dtype() ||
+      query.dtype() != value.dtype() ||
+      (block_size != 8 && block_size != 16 && block_size != 32) ||
+      (query.dtype() != bfloat16 && query.dtype() != float16)) {
+    return std::nullopt;
+  }
+  const GqaDecodeLengthPlan empty_plan{};
+  PagedAttentionMetadata metadata{
+      gqa_length_plan ? *gqa_length_plan : empty_plan,
+      query.dtype(), key.dtype(), value.dtype()};
+  metadata.query_tokens = query.shape(0);
+  metadata.query_sequences = num_seqs;
+  metadata.head_size = query.shape(2);
+  metadata.num_heads = query.shape(1);
+  metadata.num_kv_heads = key.shape(2);
+  metadata.block_size = block_size;
+  metadata.max_seq_len = max_seq_len;
+  metadata.sliding_window = -1;
+  metadata.window_seqlen_q = 1;
+  metadata.item_size = query.itemsize();
+  metadata.nax_ready = nax_lib_ready_;
+  metadata.nax_enabled = nax_enabled_;
+  metadata.num_decode_requests = num_decode_requests;
+  metadata.num_decode_tokens = num_decode_tokens;
+  metadata.max_decode_context_len = max_decode_context_len;
+  metadata.nax_split_hint = metadata.nax_prefill_split_hint = -1;
+  const auto plan = select_paged_attention_route(
+      metadata, [] {}, [] {}, gpu_core_count, detected_gpu_core_count);
+  // Preserve the existing specialized split-decode and NAX routes.
+  if (plan.route != PagedAttentionRoute::Tiled) return std::nullopt;
+  return plan.tile_config->TILE_KV;
 }
 
 struct PagedAttentionKernelPlan {

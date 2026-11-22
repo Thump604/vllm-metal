@@ -847,8 +847,9 @@ class TestSDPAForward:
 
         assert output.shape == (_BATCH, query_rows, _HIDDEN)
 
-    def test_bounded_long_prefill_keeps_decode_rows_in_the_packed_batch(
-        self, monkeypatch
+    @pytest.mark.parametrize("native_alignment", [16, None])
+    def test_bounded_long_prefill_respects_native_attention_route(
+        self, monkeypatch, native_alignment
     ) -> None:
         inner = _make_inner(head_dim=256, dtype=mx.bfloat16)
         inner.o_proj = nn.Identity()
@@ -890,6 +891,12 @@ class TestSDPAForward:
             return mx.zeros_like(query)
 
         monkeypatch.setattr(ops, "_tiled_key_range_for_lab", key_range, raising=False)
+        monkeypatch.setattr(
+            ops,
+            "_ordinary_tiled_key_alignment",
+            lambda *_args: native_alignment,
+            raising=False,
+        )
         monkeypatch.setattr(sdpa_mod, "_LAB_PREFILL_KEY_RANGE", 32_768)
         monkeypatch.setattr(sdpa_mod, "get_ops", lambda: ops)
         x = mx.ones((_BATCH, 257, _HIDDEN), dtype=mx.bfloat16)
@@ -897,13 +904,16 @@ class TestSDPAForward:
         output, _ = sdpa_forward(inner, x, ctx, cache, layer_idx=0)
 
         assert output.shape == (_BATCH, 257, _N_HEADS * 256)
-        assert ranges == [
+        expected = [
             (0, 32_768, False),
             (32_768, 65_536, False),
             (65_536, 98_304, False),
             (98_304, 131_072, False),
             (131_072, 131_088, True),
         ]
+        assert ranges == (expected if native_alignment else [])
+        if native_alignment is None:
+            assert ops.calls[-1].num_decode_requests == 1
 
     @pytest.mark.parametrize("cache_dtype", [mx.bfloat16, mx.float16])
     def test_output_projection_receives_the_query_dtype(

@@ -1173,6 +1173,7 @@ def sdpa_forward(
             )
             >= _PREFILL_WAIT_QK_PAIRS
         )
+        key_alignment = None
         if (
             _LAB_PREFILL_KEY_RANGE > 0
             and heavy_hybrid_prefill
@@ -1180,9 +1181,23 @@ def sdpa_forward(
             and ctx.verify_window_q == 1
             and q_3d.shape[2] == 256
             and max_seq_len > _LAB_PREFILL_KEY_RANGE
+            and not mm_kwargs
             and not attn_softcap
             and sinks is None
         ):
+            key_alignment = ops._ordinary_tiled_key_alignment(
+                q_3d,
+                kernel_k_cache,
+                kernel_v_cache,
+                len(ctx.context_lens),
+                kernel_block_size,
+                max_seq_len,
+                paged_kwargs.get("num_decode_requests", -1),
+                paged_kwargs.get("num_decode_tokens", 0),
+                paged_kwargs.get("max_decode_context_len", 0),
+                paged_kwargs.get("gqa_length_plan"),
+            )
+        if key_alignment is not None and _LAB_PREFILL_KEY_RANGE % key_alignment == 0:
             logger.info_once(
                 "Metal lab: continuing FP32 prefill across %d-key ranges with %d active decode rows.",
                 _LAB_PREFILL_KEY_RANGE,
@@ -1201,12 +1216,13 @@ def sdpa_forward(
                     attn_scale,
                     kernel_block_size,
                     start,
-                    (end + 15) // 16 * 16,
+                    (end + key_alignment - 1) // key_alignment * key_alignment,
                     end == max_seq_len,
                     state,
                 )
+                # End the range outside native eval_gpu, where MLX owns the buffer.
                 mx.eval(state)
-                mx.synchronize()
+                mx.synchronize(mx.default_stream(mx.gpu))
             out = state
         else:
             out = ops.paged_attention_primitive(
