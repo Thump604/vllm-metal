@@ -345,6 +345,43 @@ def _mixed_call(inputs, **overrides):
     return out
 
 
+def test_tiled_key_ranges_preserve_packed_rows_with_translated_pages(
+    force_tiled_prefill,
+):
+    ops = get_ops()
+    inputs = _mixed_inputs(
+        [131], prefill_kv=1057, geometry=(24, 4, 256, 16), cache_block=784
+    )
+    plain = bounded = inputs["query"]
+    for _ in range(2):
+        plain = _mixed_call(
+            inputs, query=plain, num_decode_requests=0, num_decode_tokens=0
+        )
+        assert _dispatch_family() == "tiled_prefill"
+        # The decode row exhausts its keys in the first range; the prefill
+        # still reaches a partial final key tile through translated pages.
+        previous = None
+        for begin, end in ((0, 512), (512, 1024), (1024, 1072)):
+            previous = ops._tiled_key_range_for_lab(
+                bounded,
+                inputs["key_cache"],
+                inputs["value_cache"],
+                inputs["block_tables"],
+                inputs["seq_lens"],
+                inputs["cu_seqlens_q"],
+                inputs["scale"],
+                inputs["block_size"],
+                begin,
+                end,
+                end == 1072,
+                previous,
+            )
+            mx.eval(previous)
+            mx.synchronize()
+        bounded = previous
+        assert mx.array_equal(bounded, plain).item()
+
+
 def _assert_mixed_matches_standalone(inputs, lengths, family, partition, **routing):
     """Check routing and row ownership against the independently tested kernels."""
     ops = get_ops()
