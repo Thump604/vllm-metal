@@ -352,21 +352,18 @@ def test_tiled_key_ranges_preserve_packed_rows_with_translated_pages(
     inputs = _mixed_inputs(
         [131], prefill_kv=1057, geometry=(24, 4, 256, 16), cache_block=784
     )
-    assert (
-        ops._ordinary_tiled_key_alignment(
-            inputs["query"],
-            inputs["key_cache"],
-            inputs["value_cache"],
-            2,
-            inputs["block_size"],
-            inputs["max_seq_len"],
-            1,
-            1,
-            inputs["max_decode_context_len"],
-            ops.gqa_decode_length_plan([131]),
-        )
-        == 16
-    )
+    assert ops._tiled_key_range_plan_for_lab(
+        inputs["query"],
+        inputs["key_cache"],
+        inputs["value_cache"],
+        2,
+        inputs["block_size"],
+        inputs["max_seq_len"],
+        1,
+        1,
+        inputs["max_decode_context_len"],
+        ops.gqa_decode_length_plan([131]),
+    ) == (16, False)
     plain = bounded = inputs["query"]
     range_inputs = tuple(
         inputs[name]
@@ -409,25 +406,56 @@ def test_tiled_key_ranges_preserve_packed_rows_with_translated_pages(
 
 def test_bounded_tiled_plan_keeps_native_split_decode(force_tiled_prefill):
     ops = get_ops()
-    inputs = _mixed_inputs([256, 300], geometry=(24, 4, 256, 16), prefill_kv=1057)
+    inputs = _mixed_inputs(
+        [256, 300], geometry=(24, 4, 256, 16), prefill_kv=1057, cache_block=784
+    )
     prefix_plan = ops.gqa_decode_length_plan([256, 300])
-    _mixed_call(inputs, gqa_length_plan=prefix_plan)
+    mixed = _mixed_call(inputs, gqa_length_plan=prefix_plan)
     assert _dispatch_family() == "mixed_prefill_decode"
-    assert (
-        ops._ordinary_tiled_key_alignment(
-            inputs["query"],
+    assert ops._tiled_key_range_plan_for_lab(
+        inputs["query"],
+        inputs["key_cache"],
+        inputs["value_cache"],
+        3,
+        inputs["block_size"],
+        inputs["max_seq_len"],
+        inputs["num_decode_requests"],
+        inputs["num_decode_tokens"],
+        inputs["max_decode_context_len"],
+        prefix_plan,
+    ) == (16, True)
+    query = inputs["query"]
+    tables = inputs["block_tables"]
+    lengths = inputs["seq_lens"]
+    offsets = inputs["cu_seqlens_q"]
+    decode = _mixed_call(
+        inputs,
+        query=query[:2],
+        block_tables=tables[:2],
+        seq_lens=lengths[:2],
+        cu_seqlens_q=offsets[:3],
+        max_seq_len=300,
+        gqa_length_plan=prefix_plan,
+    )
+    prefill = None
+    for begin, end in ((0, 512), (512, 1024), (1024, 1072)):
+        prefill = ops._tiled_key_range_for_lab(
+            query[2:],
             inputs["key_cache"],
             inputs["value_cache"],
-            3,
+            tables[2:],
+            lengths[2:],
+            offsets[2:] - 2,
+            inputs["scale"],
             inputs["block_size"],
-            inputs["max_seq_len"],
-            inputs["num_decode_requests"],
-            inputs["num_decode_tokens"],
-            inputs["max_decode_context_len"],
-            prefix_plan,
+            begin,
+            end,
+            end == 1072,
+            prefill,
         )
-        is None
-    )
+        mx.eval(prefill)
+        mx.synchronize()
+    assert mx.array_equal(mixed, mx.concatenate((decode, prefill))).item()
 
 
 def _assert_mixed_matches_standalone(inputs, lengths, family, partition, **routing):

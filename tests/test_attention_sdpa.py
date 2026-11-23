@@ -735,6 +735,7 @@ class _PagedRoutingOpsSpy:
     ) -> mx.array:
         del window_seqlen_q, sinks
         self.calls[-1].block_tables = block_tables.tolist()
+        self.calls[-1].query_rows = _query.shape[0]
         self.calls[-1].block_size = block_size
         self.calls[-1].num_decode_requests = num_decode_requests
         self.calls[-1].gqa_disabled = gqa_disabled
@@ -847,17 +848,20 @@ class TestSDPAForward:
 
         assert output.shape == (_BATCH, query_rows, _HIDDEN)
 
-    @pytest.mark.parametrize("native_alignment", [16, None])
+    @pytest.mark.parametrize("native_plan", [(16, False), (16, True), None])
     def test_bounded_long_prefill_respects_native_attention_route(
-        self, monkeypatch, native_alignment
+        self, monkeypatch, native_plan
     ) -> None:
         inner = _make_inner(head_dim=256, dtype=mx.bfloat16)
         inner.o_proj = nn.Identity()
         ctx = _make_ctx(257)
-        ctx.context_lens = [131, 131_073]
+        split_decode = native_plan == (16, True)
+        decode_context = 1_176 if split_decode else 131
+        ctx.context_lens = [decode_context, 131_073]
         ctx.block_tables = [[0], [1]]
         ctx.cu_seqlens = [0, 1, 257]
         ctx.num_decode_requests = ctx.num_decode_tokens = 1
+        ctx.max_decode_context_len = decode_context
         ctx.state_group_slot_mappings = ([0, 1],)
         cache = make_kv_cache(
             num_layers=1,
@@ -884,17 +888,17 @@ class TestSDPAForward:
             final,
             _previous,
         ):
-            assert lengths.tolist() == [131, 131_073]
-            assert boundaries.tolist() == [0, 1, 257]
-            assert query.shape[0] == 257
+            assert lengths.tolist() == ([131_073] if split_decode else [131, 131_073])
+            assert boundaries.tolist() == ([0, 256] if split_decode else [0, 1, 257])
+            assert query.shape[0] == (256 if split_decode else 257)
             ranges.append((begin, end, final))
             return mx.zeros_like(query)
 
         monkeypatch.setattr(ops, "_tiled_key_range_for_lab", key_range, raising=False)
         monkeypatch.setattr(
             ops,
-            "_ordinary_tiled_key_alignment",
-            lambda *_args: native_alignment,
+            "_tiled_key_range_plan_for_lab",
+            lambda *_args: native_plan,
             raising=False,
         )
         monkeypatch.setattr(sdpa_mod, "_LAB_PREFILL_KEY_RANGE", 32_768)
@@ -911,9 +915,12 @@ class TestSDPAForward:
             (98_304, 131_072, False),
             (131_072, 131_088, True),
         ]
-        assert ranges == (expected if native_alignment else [])
-        if native_alignment is None:
+        assert ranges == (expected if native_plan else [])
+        if native_plan is None or split_decode:
             assert ops.calls[-1].num_decode_requests == 1
+            assert ops.calls[-1].num_decode_tokens == 1
+            assert ops.calls[-1].max_decode_context_len == decode_context
+            assert ops.calls[-1].query_rows == (1 if split_decode else 257)
 
     @pytest.mark.parametrize("cache_dtype", [mx.bfloat16, mx.float16])
     def test_output_projection_receives_the_query_dtype(

@@ -1174,7 +1174,7 @@ def sdpa_forward(
             )
             >= _PREFILL_WAIT_QK_PAIRS
         )
-        key_alignment = None
+        range_plan = None
         if (
             _LAB_PREFILL_KEY_RANGE > 0
             and heavy_hybrid_prefill
@@ -1186,7 +1186,7 @@ def sdpa_forward(
             and not attn_softcap
             and sinks is None
         ):
-            key_alignment = ops._ordinary_tiled_key_alignment(
+            range_plan = ops._tiled_key_range_plan_for_lab(
                 q_3d,
                 kernel_k_cache,
                 kernel_v_cache,
@@ -1198,33 +1198,72 @@ def sdpa_forward(
                 paged_kwargs.get("max_decode_context_len", 0),
                 paged_kwargs.get("gqa_length_plan"),
             )
-        if key_alignment is not None and _LAB_PREFILL_KEY_RANGE % key_alignment == 0:
+        split_decode = range_plan is not None and range_plan[1]
+        key_limit = ctx.context_lens[-1] if split_decode else max_seq_len
+        if (
+            range_plan is not None
+            and key_limit > _LAB_PREFILL_KEY_RANGE
+            and _LAB_PREFILL_KEY_RANGE % range_plan[0] == 0
+        ):
+            key_alignment, _ = range_plan
             logger.info_once(
                 "Metal lab: continuing FP32 prefill across %d-key ranges with %d active decode rows.",
                 _LAB_PREFILL_KEY_RANGE,
                 num_decode,
             )
-            state = None
-            for start in range(0, max_seq_len, _LAB_PREFILL_KEY_RANGE):
-                end = min(start + _LAB_PREFILL_KEY_RANGE, max_seq_len)
-                state = ops._tiled_key_range_for_lab(
-                    q_3d,
+            decode_output = None
+            range_query, range_tables = q_3d, block_tables
+            range_lengths, range_offsets = seq_lens, cu_seqlens_q
+            if split_decode:
+                # Preserve the native one-token decode route. Only prefill
+                # spans the long keys and needs separate command buffers.
+                decode_output = ops.paged_attention_primitive(
+                    q_3d[:num_decode],
                     kernel_k_cache,
                     kernel_v_cache,
-                    block_tables,
-                    seq_lens,
-                    cu_seqlens_q,
+                    cache_kv_heads,
+                    attn_scale,
+                    attn_softcap,
+                    block_tables[:num_decode],
+                    seq_lens[:num_decode],
+                    cu_seqlens_q[: num_decode + 1],
+                    kernel_block_size,
+                    ctx.max_decode_context_len,
+                    layer_sliding_window,
+                    **paged_kwargs,
+                )
+                range_query = q_3d[num_decode:]
+                range_tables = block_tables[num_decode:]
+                range_lengths = seq_lens[num_decode:]
+                range_offsets = cu_seqlens_q[num_decode:] - num_decode
+            state = None
+            for start in range(0, key_limit, _LAB_PREFILL_KEY_RANGE):
+                end = min(start + _LAB_PREFILL_KEY_RANGE, key_limit)
+                state = ops._tiled_key_range_for_lab(
+                    range_query,
+                    kernel_k_cache,
+                    kernel_v_cache,
+                    range_tables,
+                    range_lengths,
+                    range_offsets,
                     attn_scale,
                     kernel_block_size,
                     start,
                     (end + key_alignment - 1) // key_alignment * key_alignment,
-                    end == max_seq_len,
+                    end == key_limit,
                     state,
                 )
                 # End the range outside native eval_gpu, where MLX owns the buffer.
                 mx.eval(state)
                 mx.synchronize(mx.default_stream(mx.gpu))
-            out = state
+            out = mx.concatenate((decode_output, state)) if split_decode else state
+            if split_decode and _LAB_TRACE_SPLIT_DECODE:
+                logger.info(
+                    "Metal lab native dispatch: family=bounded_prefill_native_decode "
+                    "visible_keys=%d decode_context=%d",
+                    key_limit,
+                    ctx.max_decode_context_len,
+                )
         else:
             trace_split = (
                 _LAB_TRACE_SPLIT_DECODE and heavy_hybrid_prefill and num_decode > 0

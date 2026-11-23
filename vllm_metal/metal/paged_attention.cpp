@@ -944,7 +944,7 @@ static PagedAttentionPlan select_paged_attention_route(
   return plan;
 }
 
-std::optional<int> ordinary_tiled_key_alignment(
+std::optional<std::tuple<int, bool>> tiled_key_range_plan_for_lab(
     const array& query, const array& key, const array& value,
     int num_seqs, int block_size, int max_seq_len, int num_decode_requests,
     int num_decode_tokens, int max_decode_context_len,
@@ -978,9 +978,10 @@ std::optional<int> ordinary_tiled_key_alignment(
   metadata.nax_split_hint = metadata.nax_prefill_split_hint = -1;
   const auto plan = select_paged_attention_route(
       metadata, [] {}, [] {}, gpu_core_count, detected_gpu_core_count);
-  // Preserve the existing specialized split-decode and NAX routes.
-  if (plan.route != PagedAttentionRoute::Tiled) return std::nullopt;
-  return plan.tile_config->TILE_KV;
+  if (plan.route != PagedAttentionRoute::Tiled &&
+      plan.route != PagedAttentionRoute::MixedTiled) return std::nullopt;
+  return std::tuple{plan.tile_config->TILE_KV,
+                    plan.route == PagedAttentionRoute::MixedTiled};
 }
 
 struct PagedAttentionKernelPlan {
