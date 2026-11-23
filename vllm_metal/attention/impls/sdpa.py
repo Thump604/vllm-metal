@@ -76,6 +76,7 @@ logger = init_logger(__name__)
 # chunks can hit the same guard at different context lengths.
 _PREFILL_WAIT_QK_PAIRS = 32 * 1024 * 1024
 _LAB_PREFILL_KEY_RANGE = int(os.environ.get("AI_OPS_TILED_KEY_RANGE", "0"))
+_LAB_TRACE_SPLIT_DECODE = os.environ.get("AI_OPS_TRACE_SPLIT_DECODE") == "1"
 
 
 def _has_packed_qkv_sdpa_contract(module: nn.Module) -> bool:
@@ -1225,6 +1226,12 @@ def sdpa_forward(
                 mx.synchronize(mx.default_stream(mx.gpu))
             out = state
         else:
+            trace_split = (
+                _LAB_TRACE_SPLIT_DECODE and heavy_hybrid_prefill and num_decode > 0
+            )
+            trace_previous = (
+                ops._set_paged_dispatch_diagnostics(True) if trace_split else False
+            )
             out = ops.paged_attention_primitive(
                 q_3d,
                 kernel_k_cache,
@@ -1250,6 +1257,14 @@ def sdpa_forward(
                 )
                 mx.eval(out)
                 mx.synchronize()
+                if trace_split:
+                    logger.info(
+                        "Metal lab native dispatch: family=%s visible_keys=%d decode_context=%d",
+                        ops.last_paged_dispatch(),
+                        max_seq_len,
+                        ctx.max_decode_context_len,
+                    )
+                    ops._set_paged_dispatch_diagnostics(trace_previous)
 
     if recompute_after_kernel:
         assert ctx.cu_seqlens is not None
